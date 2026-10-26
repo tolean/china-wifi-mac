@@ -1,0 +1,10 @@
+{
+  "log": { "level": "info", "timestamp": true },
+  "dns": { "servers": [ { "type": "local", "tag": "local" } ] },
+  "inbounds": [
+    { "type": "redirect", "tag": "car",  "listen": "127.0.0.1", "listen_port": 7892 },
+    { "type": "mixed",    "tag": "test", "listen": "127.0.0.1", "listen_port": 2080 }
+  ],
+  "outbounds": [ { "type": "direct", "tag": "proxy" } ],
+  "route": { "final": "proxy", "default_domain_resolver": "local" }
+}
