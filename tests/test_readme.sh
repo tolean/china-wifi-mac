@@ -24,3 +24,19 @@ grep -qE "t\.me/|@[a-zA-Z0-9_]{4,}" $R && fail "forbidden link/username"
 grep -qE "ss://[A-Za-z0-9+/=]{20,}" $R && fail "looks like a real key"
 grep -q "LDP95" $R && fail "VIN leaked"
 echo README-OK
+
+# --- issue templates
+D=$PUB/.github/ISSUE_TEMPLATE
+grep -q "blank_issues_enabled: false" $D/config.yml 2>/dev/null || fail "config.yml: blank issues must be off"
+for f in tested-on problem; do
+  head -1 $D/$f.md 2>/dev/null | grep -q '^---$' || fail "$f.md: front matter"
+  grep -q "^name:" $D/$f.md   || fail "$f.md: name"
+  grep -q "^labels:" $D/$f.md || fail "$f.md: labels"
+  grep -q "Не вставляйте ключи, VIN и идентификаторы аккаунта" $D/$f.md || fail "$f.md: privacy warning"
+  grep -q "zsh car-vpn.sh check" $D/$f.md || fail "$f.md: asks for check output"
+done
+grep -q "Проверил на" $D/tested-on.md      || fail "tested-on.md: title"
+grep -q "inbound/redirect" $D/tested-on.md || fail "tested-on.md: asks for redirect lines"
+grep -q "На каком шаге" $D/problem.md      || fail "problem.md: asks which step"
+grep -q "20 строк" $D/problem.md           || fail "problem.md: asks for log tail"
+echo TEMPLATES-OK
