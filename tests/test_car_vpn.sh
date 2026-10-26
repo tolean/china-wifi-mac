@@ -62,4 +62,25 @@ assert_eq $rc 1 "bridge_net without bridge100"
 assert_contains "$(fn watch_log_line '+0200 2026-10-26 20:22:10 INFO [1 0ms] inbound/redirect[car]: inbound connection to 8.136.127.53:1663')" "→ 8.136.127.53:1663" "redirect line"
 assert_contains "$(fn watch_log_line '+0200 2026-10-26 20:23:04 ERROR network: missing default interface')" "переподключите Monkey" "tunnel drop line"
 assert_eq "$(fn watch_log_line '+0200 2026-10-26 20:22:10 INFO outbound/direct[proxy]: outbound connection to x')" "" "noise line"
+# --- check: structure holds in whatever state the Mac is in right now
+out=$(CWM_SECRETS=$T zsh $PUB/car-vpn.sh check 2>&1); rc=$?
+assert_contains "$(echo "$out" | head -1)" "режим: Monkey" "check first line"
+assert_contains "$out" "=== Проверка цепочки" "check header"
+# every ❌/⚠️ line is followed by a → line
+echo "$out" | awk '/❌|⚠️/{need=1; next} need && !/→/{bad=1} {need=0} END{exit bad}' || fail "a ❌/⚠️ line has no → fix line:
+$out"
+# last line and exit code agree
+last=$(echo "$out" | tail -1); n=$(echo "$out" | grep -c '^  ❌')
+if (( n == 0 )); then
+  assert_eq "$last" "=== Всё готово." "check last line (clean)"; assert_eq $rc 0 "check exit (clean)"
+else
+  assert_contains "$last" "Проблем: $n" "check last line (problems)"; assert_eq $rc 1 "check exit (problems)"
+fi
+# sing-box probe
+out=$(CWM_SINGBOX=/nonexistent CWM_SECRETS=$T zsh $PUB/car-vpn.sh check 2>&1)
+assert_contains "$out" "❌ нет sing-box" "sing-box probe"; assert_contains "$out" "brew install sing-box" "sing-box fix"
+# key mode line
+touch $T/china-key.txt
+assert_contains "$(CWM_SECRETS=$T zsh $PUB/car-vpn.sh check | head -1)" "режим: ключ" "check first line (key)"
+rm $T/china-key.txt
 echo ALL-OK

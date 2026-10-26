@@ -117,8 +117,114 @@ bridge_net() {
   echo "$(( (net >> 24) & 255 )).$(( (net >> 16) & 255 )).$(( (net >> 8) & 255 )).$(( net & 255 ))/$prefix"
 }
 
+ok()   { echo "  ✅ $1" }
+warn() { echo "  ⚠️  $1"; shift; local l; for l in "$@"; do echo "       → $l"; done }
+bad()  { echo "  ❌ $1"; shift; local l; for l in "$@"; do echo "       → $l"; done; FAIL=$(( FAIL + 1 )) }
+
+hw_device() {  # hw_device "Wi-Fi" → en0
+  networksetup -listallhardwareports 2>/dev/null | awk -v p="Hardware Port: $1" '$0==p{getline; print $2; exit}'
+}
+
+# Проверяет всю цепочку и печатает, что не так и как исправить. Возвращает число ❌.
 diagnose() {
-  return 0
+  FAIL=0
+  local mode=$(detect_mode)
+  if [[ $mode == key ]]; then echo "режим: ключ (secrets/china-key.txt)"
+  else echo "режим: Monkey (нет secrets/china-key.txt)"; fi
+  echo "=== Проверка цепочки iPhone ─USB─► Mac ─Wi-Fi─► устройство"
+  local settings="Настройки → Основные → Общий доступ → Общий интернет (i) → Share from: iPhone USB, To: Wi-Fi"
+
+  # 1. Интернет на Мак по кабелю от iPhone
+  local usb_if=$(hw_device "iPhone USB") usb_ip=""
+  [[ -n $usb_if ]] && usb_ip=$(ifconfig $usb_if 2>/dev/null | awk '/inet /{print $2; exit}')
+  if [[ -z $usb_if ]]; then
+    bad "iPhone USB: Мак не видит iPhone как сетевое устройство" \
+        "подключите iPhone кабелем, на iPhone нажмите «Доверять»"
+  elif [[ -z $usb_ip ]]; then
+    bad "iPhone USB ($usb_if): кабель есть, но интернета нет" \
+        "iPhone: Настройки → Режим модема → «Разрешать другим» — включить" \
+        "если включено — выньте и снова вставьте кабель"
+  else
+    ok "iPhone USB ($usb_if): $usb_ip"
+  fi
+
+  local br_ip=$(ifconfig bridge100 2>/dev/null | awk '/inet /{print $2; exit}')
+
+  # 2. Wi-Fi Мака свободен для раздачи (или уже раздаёт)
+  local wifi_if=$(hw_device "Wi-Fi")
+  local wifi_power=$(networksetup -getairportpower $wifi_if 2>/dev/null | awk '{print $NF}')
+  local wifi_ip=$(ifconfig $wifi_if 2>/dev/null | awk '/inet /{print $2; exit}')
+  if [[ $wifi_power != On ]]; then
+    bad "Wi-Fi ($wifi_if) выключен" "включите Wi-Fi (но ни к какой сети не подключайтесь)"
+  elif [[ -n $wifi_ip && -z $br_ip ]]; then
+    bad "Wi-Fi ($wifi_if) подключён к сети как клиент (IP $wifi_ip) — раздавать не может" \
+        "строка меню → Wi-Fi → нажмите на подключённую сеть, чтобы отключиться" \
+        "Настройки → Wi-Fi → (…) у этой сети → выключить «Автоподключение»"
+  elif [[ -n $wifi_ip ]]; then
+    ok "Wi-Fi ($wifi_if) раздаёт"
+  else
+    ok "Wi-Fi ($wifi_if) свободен"
+  fi
+
+  # 3. «Общий интернет»: источник, bridge100, подключённые устройства
+  local natdump=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null)
+  local src=$(echo "$natdump" | awk '/PrimaryInterface/,/}/' \
+              | sed -n 's/.*PrimaryUserReadable = "\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p' | head -1)
+  local netname=$(echo "$natdump" | sed -n 's/.*NetworkName = "\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p' | head -1)
+  if [[ -z $src ]]; then
+    warn "не смог определить источник «Общего интернета»" "$settings"
+  elif [[ $src != "iPhone USB" ]]; then
+    bad "«Общий интернет» берёт интернет из «$src», а нужно из «iPhone USB»" "$settings"
+  fi
+  if [[ -z $br_ip ]]; then
+    bad "«Общий интернет» не работает (нет bridge100)" \
+        "сначала исправьте пункты выше, затем выключите и снова включите «Общий интернет»"
+  else
+    ok "«Общий интернет» раздаёт Wi-Fi «$netname», шлюз $br_ip"
+    local -a clients
+    clients=($(arp -an -i bridge100 2>/dev/null | awk -v gw="($br_ip)" \
+      '$2!=gw && $2!~/\.255\)$/ && $2!~/^\(2(2[4-9]|3[0-9])\./ && $4!="(incomplete)" {gsub(/[()]/,"",$2); print $2}'))
+    if (( ${#clients} )); then
+      ok "подключено устройств: ${#clients} (${(j:, :)clients})"
+    else
+      warn "к Wi-Fi Мака пока никто не подключён" "на устройстве: Настройки → Wi-Fi → выберите сеть Мака"
+    fi
+  fi
+
+  # 4. sing-box
+  local sb
+  if sb=$(find_singbox 2>/dev/null); then ok "sing-box: $sb"
+  else bad "нет sing-box" "brew install sing-box"; fi
+
+  # 5. Выход в Китай
+  local def=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+  local monkey=$(scutil --nc list 2>/dev/null | awk '/top.monkey.speed/{gsub(/[()]/,"",$2); print $2; exit}')
+  if [[ $mode == monkey ]]; then
+    if [[ $def != utun* ]]; then
+      bad "режим Monkey, но VPN Мака не ведёт трафик (Monkey: ${monkey:-не найден}, маршрут: ${def:-нет})" \
+          "Monkey Speed на Маке: GlobalMode → сервер Пекин → подключить"
+    else
+      local ip=$(curl -s -m 8 https://myip.ipip.net 2>/dev/null)
+      if [[ $ip == *中国* && $ip != *香港* ]]; then
+        ok "Мак выходит через Китай: $ip"
+      elif [[ $ip == *香港* ]]; then
+        warn "Мак выходит через Гонконг: $ip" "в Monkey выберите сервер Пекин (北京) — Гонконг может не подойти"
+      else
+        bad "Monkey подключён, но Мак выходит не через Китай: ${ip:-нет ответа}" \
+            "в Monkey включите GlobalMode (全局), а не умный режим" "переподключите Monkey"
+      fi
+    fi
+  else
+    if [[ $def == utun* ]]; then
+      bad "режим с ключом, но на Маке включён VPN ($def)" "выключите Monkey/другой VPN на Маке"
+    else
+      ok "режим с ключом, VPN на Маке выключен"
+    fi
+  fi
+
+  if (( FAIL )); then echo "=== Проблем: $FAIL. Исправьте пункты с ❌ и запустите снова."
+  else echo "=== Всё готово."; fi
+  return $FAIL
 }
 
 need_root() {
@@ -167,7 +273,7 @@ cmd_car() {
 
 if [[ -z ${CWM_SOURCED:-} ]]; then
   case ${1:-} in
-    check) diagnose; exit $? ;;
+    check) diagnose && exit 0 || exit 1 ;;
     test)  cmd_test; exit $? ;;
     car)   cmd_car ;;
     off)   need_root off; stop_all ;;
