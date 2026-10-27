@@ -182,10 +182,14 @@ def main(argv=None) -> int:
     except (ValueError, OSError) as e:
         print(f"Не смог разобрать ключ: {e}", file=sys.stderr)
         return 1
-    fd = os.open(out_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(build_config(outbound), f, indent=2)
-    os.chmod(out_file, 0o600)
+    try:
+        fd = os.open(out_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(build_config(outbound), f, indent=2)
+        os.chmod(out_file, 0o600)
+    except OSError as e:
+        print(f"Не смог записать {out_file}: {e}", file=sys.stderr)
+        return 1
     print(f"OK: {outbound['type']} → {outbound['server']}:{outbound['server_port']}")
     return 0
 

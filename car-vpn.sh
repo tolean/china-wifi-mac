@@ -14,6 +14,10 @@
 # utun: единственное правило — pf rdr — отдаёт их локальному sing-box, а тот сам
 # открывает соединения как обычный процесс Мака (через VPN Мака или по ключу).
 
+# Без этого zsh выполняет EXIT-trap, поставленный внутри функции, при выходе из функции,
+# а не из скрипта — и очистка в arm_cleanup срабатывала бы не тогда.
+setopt posix_traps
+
 SCRIPT_DIR=${${(%):-%x}:A:h}
 SECRETS=${CWM_SECRETS:-$SCRIPT_DIR/secrets}
 CONFIG=$SECRETS/car-vpn.json
@@ -24,18 +28,25 @@ TIMEOUT_MIN=${CWM_TIMEOUT_MIN:-15}
 REDIRECT_PORT=7892
 TEST_PORT=2080
 TAILPID=""
+WAITPID=""
 
 detect_mode() {
   [[ -f $SECRETS/china-key.txt ]] && echo key || echo monkey
 }
 
+chown_secrets() {  # после sudo папка secrets/ не должна остаться root-овской (иначе ключ потом не положить)
+  [[ $EUID -eq 0 && -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER" $SECRETS 2>/dev/null
+  return 0
+}
+
 ensure_config() {
   mkdir -p $SECRETS
   if [[ $(detect_mode) == key ]]; then
-    python3 -I $SCRIPT_DIR/make_config.py --secrets $SECRETS
+    python3 -I $SCRIPT_DIR/make_config.py --secrets $SECRETS || return 1
   else
-    cp $SCRIPT_DIR/config.monkey.json $CONFIG
+    cp $SCRIPT_DIR/config.monkey.json $CONFIG || return 1
   fi
+  chown_secrets
 }
 
 find_singbox() {
@@ -53,14 +64,19 @@ find_singbox() {
   return 1
 }
 
+singbox_pid_is_ours() {  # pid из pid-файла после перезагрузки может достаться чужому процессу
+  [[ -n $1 ]] && ps -p $1 -o command= 2>/dev/null | grep -q -- "sing-box run -c $CONFIG"
+}
+
 stop_singbox() {
-  if [[ -f $PIDFILE ]]; then
-    local pid=$(<$PIDFILE)
+  [[ -f $PIDFILE ]] || return 0
+  local pid=$(<$PIDFILE)
+  if singbox_pid_is_ours $pid; then
     kill $pid 2>/dev/null
     local i
     for i in {1..20}; do kill -0 $pid 2>/dev/null || break; sleep 0.1; done
-    rm -f $PIDFILE
   fi
+  rm -f $PIDFILE
 }
 
 start_singbox() {
@@ -70,16 +86,22 @@ start_singbox() {
   $sb check -c $CONFIG || return 1
   if [[ -f $PIDFILE ]]; then
     local old=$(<$PIDFILE)
-    if kill -0 $old 2>/dev/null; then
+    if singbox_pid_is_ours $old; then
       echo "sing-box уже запущен (pid $old) — сначала: sudo zsh car-vpn.sh off" >&2
       return 1
     fi
-    rm -f $PIDFILE
+    rm -f $PIDFILE  # устаревший pid-файл: процесса нет или это не наш sing-box
   fi
   $sb run -c $CONFIG > $LOG 2>&1 &
-  echo $! > $PIDFILE
+  local pid=$!
+  echo $pid > $PIDFILE
   local i
-  for i in {1..20}; do nc -z 127.0.0.1 $TEST_PORT 2>/dev/null && return 0; sleep 0.25; done
+  for i in {1..20}; do
+    kill -0 $pid 2>/dev/null || break
+    # порт 2080 должен слушать именно наш процесс, а не чужой Clash / sing-box
+    lsof -nP -iTCP:$TEST_PORT -sTCP:LISTEN -t 2>/dev/null | grep -qx $pid && return 0
+    sleep 0.25
+  done
   echo "sing-box не запустился, см. $LOG" >&2
   tail -5 $LOG >&2
   stop_singbox
@@ -87,10 +109,44 @@ start_singbox() {
 }
 
 stop_all() {
+  [[ -n ${CLEANED:-} ]] && return 0
+  CLEANED=1
+  [[ -n $WAITPID ]] && kill $WAITPID 2>/dev/null
   [[ -n $TAILPID ]] && kill $TAILPID 2>/dev/null
+  pkill -f "tail -n 0 -f $LOG" 2>/dev/null
   [[ $EUID -eq 0 ]] && pfctl -a $ANCHOR -F all >/dev/null 2>&1
   stop_singbox
+  chown_secrets
   echo "=== правило снято, sing-box остановлен"
+}
+
+# Очистка на Ctrl+C, kill, закрытие окна Терминала (HUP) и на обычном выходе.
+arm_cleanup() {
+  local fn=$1
+  # kill \$WAITPID: пока `wait` внутри функции ждёт ребёнка, `exit` из trap не срабатывает;
+  # снимаем ожидание — и выход происходит сразу.
+  trap "$fn; kill \$WAITPID 2>/dev/null; exit 130" INT
+  trap "$fn; kill \$WAITPID 2>/dev/null; exit 143" TERM HUP
+  trap "$fn" EXIT
+}
+
+# sleep, который сигнал прерывает сразу: foreground-команду zsh дожидается и только потом
+# выполняет trap, а `wait` фоновой команды прерывается немедленно.
+pause() {
+  sleep $1 & WAITPID=$!
+  wait $WAITPID
+  WAITPID=""
+}
+
+start_log_watch() {
+  : >> $LOG
+  tail -n 0 -f $LOG > >(while read -r l; do watch_log_line "$l"; done) &
+  TAILPID=$!   # именно tail, а не subshell-читатель
+}
+
+exit_still_ok() {  # в режиме Monkey маршрут по умолчанию обязан идти через utun
+  [[ $(detect_mode) == key ]] && return 0
+  [[ $(route -n get default 2>/dev/null | awk '/interface:/{print $2}') == utun* ]]
 }
 
 # Одна строка журнала sing-box → одна строка для человека (или ничего).
@@ -231,6 +287,13 @@ need_root() {
   [[ $EUID -eq 0 ]] || { echo "Нужно: sudo zsh car-vpn.sh $1" >&2; exit 1 }
 }
 
+test_cleanup() {
+  [[ -n ${CLEANED:-} ]] && return 0
+  CLEANED=1
+  [[ -n $WAITPID ]] && kill $WAITPID 2>/dev/null
+  stop_singbox
+}
+
 cmd_test() {
   if [[ $(detect_mode) == monkey ]]; then
     echo "Режим Monkey: проверка ключа не нужна, используйте: zsh car-vpn.sh check"
@@ -238,16 +301,22 @@ cmd_test() {
   fi
   ensure_config || return 1
   start_singbox || return 1
-  trap 'stop_singbox' EXIT
-  echo "IP через ключ: $(curl -s -m 15 -x socks5h://127.0.0.1:$TEST_PORT https://myip.ipip.net)"
+  arm_cleanup test_cleanup
+  local ipfile=$SECRETS/.ip
+  curl -s -m 15 -x socks5h://127.0.0.1:$TEST_PORT https://myip.ipip.net > $ipfile 2>/dev/null & WAITPID=$!
+  wait $WAITPID; WAITPID=""
+  echo "IP через ключ: $(<$ipfile)"
+  rm -f $ipfile
   # Shadowsocks не подтверждает соединение с конечным адресом, поэтому «OK» ниже
   # для ss-ключа условно. Решающая строка — IP: должен быть 中国, а не 香港 / 摩尔多瓦.
   local h
   for h in 8.136.147.132 8.136.127.53; do
     printf "vtspivi %s:1663 через ключ: " $h
-    nc -z -G 10 -w 10 -X 5 -x 127.0.0.1:$TEST_PORT $h 1663 >/dev/null 2>&1 && echo OK || echo НЕТ
+    nc -z -G 10 -w 10 -X 5 -x 127.0.0.1:$TEST_PORT $h 1663 >/dev/null 2>&1 & WAITPID=$!
+    wait $WAITPID && echo OK || echo НЕТ
+    WAITPID=""
   done
-  stop_singbox
+  test_cleanup
 }
 
 cmd_car() {
@@ -257,17 +326,24 @@ cmd_car() {
   net=$(bridge_net) || { echo "Нет bridge100: включите «Общий интернет» (из iPhone USB в Wi-Fi)" >&2; exit 1 }
   ensure_config || exit 1
   start_singbox || exit 1
-  trap 'stop_all; exit 0' INT TERM
+  arm_cleanup stop_all
   echo "rdr pass on bridge100 inet proto tcp from $net to ! $net -> 127.0.0.1 port $REDIRECT_PORT" \
     | pfctl -a $ANCHOR -f - 2>&1 | grep -vE "ALTQ|flushing|present in the main|pf.conf|^$"
+  if (( pipestatus[2] != 0 )); then
+    echo "Не смог загрузить правило pf — см. сообщение выше" >&2
+    exit 1  # EXIT-trap снимет всё, что успели поставить
+  fi
   pfctl -E >/dev/null 2>&1
   local via=Monkey
   [[ $(detect_mode) == key ]] && via=ключ
   echo "=== активно: TCP клиентов ($net) → sing-box → $via. Откройте QR на устройстве."
   echo "=== Ctrl+C — остановить. Автостоп через $TIMEOUT_MIN мин."
-  tail -n 0 -f $LOG | while read -r l; do watch_log_line "$l"; done &
-  TAILPID=$!
-  sleep $(( TIMEOUT_MIN * 60 ))
+  start_log_watch
+  local end=$(( SECONDS + TIMEOUT_MIN * 60 ))
+  while (( SECONDS < end )); do
+    pause 10
+    exit_still_ok || echo "⚠️  VPN Мака не ведёт трафик через utun — устройство сейчас выходит НЕ через Китай. Переподключите Monkey (GlobalMode)."
+  done
   stop_all
 }
 

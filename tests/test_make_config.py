@@ -79,6 +79,16 @@ class FileAndCliTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("OK: shadowsocks → 1.2.3.4:9", r.stdout)
         self.assertEqual(stat.S_IMODE((self.tmp / "car-vpn.json").stat().st_mode), 0o600)
 
+    def test_cli_unwritable_secrets_dir_prints_one_line(self):
+        (self.tmp / "china-key.txt").write_text("ss://" + b64("aes-128-gcm:x") + "@1.2.3.4:9\n")
+        os.chmod(self.tmp, 0o500)
+        try:
+            r = subprocess.run([sys.executable, "-I", MAKE_CONFIG, "--secrets", str(self.tmp)], capture_output=True, text=True)
+        finally:
+            os.chmod(self.tmp, 0o700)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr); self.assertIn("car-vpn.json", r.stderr)
+
     def test_cli_missing_key_file(self):
         r = subprocess.run([sys.executable, "-I", MAKE_CONFIG, "--secrets", str(self.tmp)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 1); self.assertIn("china-key.txt", r.stderr)
