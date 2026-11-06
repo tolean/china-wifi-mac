@@ -229,7 +229,7 @@ diagnose() {
   local netname=$(echo "$natdump" | sed -n 's/.*NetworkName = "\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p' | head -1)
   if [[ -z $src ]]; then
     warn "не смог определить источник «Общего интернета»" "$settings"
-  elif [[ $src != "iPhone USB" ]]; then
+  elif [[ $src != "iPhone USB"* ]]; then  # macOS может назвать сервис «iPhone USB 2» после переподключения
     bad "«Общий интернет» берёт интернет из «$src», а нужно из «iPhone USB»" "$settings"
   fi
   if [[ -z $br_ip ]]; then
