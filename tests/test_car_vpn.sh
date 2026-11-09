@@ -85,6 +85,7 @@ sleep 0.3; assert_eq "$(pgrep -f "tail -n 0 -f $T/car-vpn.log" | wc -l | tr -d '
 # Monkey mode: exit_still_ok fails when the default route is not a utun
 ( export CWM_SECRETS=$T CWM_SOURCED=1; source $PUB/car-vpn.sh; route() { print "   interface: en0" }; exit_still_ok ) && fail "exit_still_ok passed with en0"
 ( export CWM_SECRETS=$T CWM_SOURCED=1; source $PUB/car-vpn.sh; route() { print "   interface: utun8" }; exit_still_ok ) || fail "exit_still_ok failed with utun8"
+( export CWM_SECRETS=$T CWM_SOURCED=1 NOVPN=1; source $PUB/car-vpn.sh; route() { print "   interface: en0" }; exit_still_ok ) || fail "exit_still_ok failed with NOVPN"
 
 # --- bridge_net derives network/prefix from bridge100's inet line (ifconfig shadowed)
 net=$( export CWM_SECRETS=$T CWM_SOURCED=1; source $PUB/car-vpn.sh

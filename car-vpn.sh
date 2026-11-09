@@ -4,6 +4,7 @@
 #   zsh car-vpn.sh check        проверить цепочку iPhone ─USB─► Mac ─Wi-Fi─► устройство
 #   zsh car-vpn.sh test         режим с ключом: проверить ключ (сеть Мака не трогает)
 #   sudo zsh car-vpn.sh car     завернуть TCP устройств в sing-box (Ctrl+C или автостоп 15 мин)
+#   sudo zsh car-vpn.sh car novpn  то же без VPN Мака (проверка: устройство выходит НЕ через Китай)
 #   sudo zsh car-vpn.sh off     аварийно снять правило и остановить sing-box
 #
 # Режим определяется сам: есть secrets/china-key.txt → режим с ключом,
@@ -145,7 +146,7 @@ start_log_watch() {
 }
 
 exit_still_ok() {  # в режиме Monkey маршрут по умолчанию обязан идти через utun
-  [[ $(detect_mode) == key ]] && return 0
+  [[ $(detect_mode) == key || -n ${NOVPN:-} ]] && return 0
   [[ $(route -n get default 2>/dev/null | awk '/interface:/{print $2}') == utun* ]]
 }
 
@@ -226,11 +227,15 @@ diagnose() {
   local natdump=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null)
   local src=$(echo "$natdump" | awk '/PrimaryInterface/,/}/' \
               | sed -n 's/.*PrimaryUserReadable = "\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p' | head -1)
+  local src_dev=$(echo "$natdump" | awk '/PrimaryInterface/,/}/' | sed -n 's/.*Device = \([^;]*\);.*/\1/p' | head -1)
   local netname=$(echo "$natdump" | sed -n 's/.*NetworkName = "\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p' | head -1)
   if [[ -z $src ]]; then
     warn "не смог определить источник «Общего интернета»" "$settings"
   elif [[ $src != "iPhone USB"* ]]; then  # macOS может назвать сервис «iPhone USB 2» после переподключения
     bad "«Общий интернет» берёт интернет из «$src», а нужно из «iPhone USB»" "$settings"
+  elif [[ -n $usb_if && -n $src_dev && $src_dev != $usb_if ]]; then  # имя то же, а устройство старое — DNS раздачи даёт SERVFAIL
+    bad "«Общий интернет» привязан к старому подключению iPhone ($src_dev), а iPhone сейчас $usb_if — у устройств не будет интернета" \
+        "выключите «Общий интернет», в «Share from» выберите другой пункт, затем снова «iPhone USB», и включите"
   fi
   if [[ -z $br_ip ]]; then
     bad "«Общий интернет» не работает (нет bridge100)" \
@@ -255,7 +260,9 @@ diagnose() {
   # 5. Выход в Китай
   local def=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
   local monkey=$(scutil --nc list 2>/dev/null | awk '/top.monkey.speed/{gsub(/[()]/,"",$2); print $2; exit}')
-  if [[ $mode == monkey ]]; then
+  if [[ -n ${NOVPN:-} ]]; then
+    warn "проверка без VPN: устройство выйдет через обычный интернет Мака, НЕ через Китай"
+  elif [[ $mode == monkey ]]; then
     if [[ $def != utun* ]]; then
       bad "режим Monkey, но VPN Мака не ведёт трафик (Monkey: ${monkey:-не найден}, маршрут: ${def:-нет})" \
           "Monkey Speed на Маке: GlobalMode → сервер Пекин → подключить"
@@ -336,6 +343,7 @@ cmd_car() {
   pfctl -E >/dev/null 2>&1
   local via=Monkey
   [[ $(detect_mode) == key ]] && via=ключ
+  [[ -n ${NOVPN:-} ]] && via="интернет Мака (без VPN)"
   echo "=== активно: TCP клиентов ($net) → sing-box → $via. Откройте QR на устройстве."
   echo "=== Ctrl+C — остановить. Автостоп через $TIMEOUT_MIN мин."
   start_log_watch
@@ -351,7 +359,7 @@ if [[ -z ${CWM_SOURCED:-} ]]; then
   case ${1:-} in
     check) diagnose && exit 0 || exit 1 ;;
     test)  cmd_test; exit $? ;;
-    car)   cmd_car ;;
+    car)   [[ ${2:-} == novpn ]] && NOVPN=1; cmd_car ;;
     off)   need_root off; stop_all ;;
     *)     sed -n '2,8p' ${(%):-%x} | sed 's/^# \{0,1\}//' ;;
   esac
